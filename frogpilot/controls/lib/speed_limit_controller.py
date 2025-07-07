@@ -203,10 +203,17 @@ class SpeedLimitController:
   def handle_limit_change(self, desired_source, desired_target, sm):
     self.speed_limit_changed_timer += DT_MDL
 
-    speed_limit_accepted = (sm["frogpilotCarState"].accelPressed and not sm["carControl"].cruiseControl.override) or params_memory.get_bool("SpeedLimitAccepted")
+    accel_pressed = sm["frogpilotCarState"].accelPressed
+    cruiseControl_override = sm["carControl"].cruiseControl.override
+    speed_limit_accepted_param = params_memory.get_bool("SpeedLimitAccepted")
+
+    print(f"[DEBUG] accelPressed: {accel_pressed}, carControl.cruiseControl.override: {cruiseControl_override}, SpeedLimitAccepted param: {speed_limit_accepted_param}")
+
+    speed_limit_accepted = (accel_pressed and not cruiseControl_override) or speed_limit_accepted_param
     speed_limit_denied = sm["frogpilotCarState"].decelPressed or (self.speed_limit_changed_timer >= 30)
 
     if speed_limit_accepted:
+      print("[DEBUG] Speed limit accepted")
       self.overridden_speed = 0
 
       self.source = desired_source
@@ -229,6 +236,7 @@ class SpeedLimitController:
       self.target = desired_target
 
     else:
+      print("[DEBUG] Speed limit change unconfirmed")
       self.source = "None"
       self.unconfirmed_speed_limit = desired_target
 
@@ -305,6 +313,8 @@ class SpeedLimitController:
     else:
       self.speed_limit_changed_timer = 0
       self.unconfirmed_speed_limit = 0
+
+    params_memory.put_bool("SpeedLimitChanged", self.speed_limit_changed_timer > DT_MDL)
 
   def update_override(self, v_cruise, v_cruise_diff, v_ego, v_ego_diff, sm):
     self.override_slc = self.overridden_speed > self.target + self.offset > 0
