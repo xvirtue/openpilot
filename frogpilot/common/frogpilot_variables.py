@@ -128,7 +128,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("AggressivePersonalityProfile", "1", 2, "0"),
   ("AlertVolumeControl", "0", 2, "0"),
   ("AlwaysOnDM", "0", 0, "0"),
-  ("AlwaysOnLateral", "1", 0, "0"),
+  ("AlwaysOnLateral"),
   ("AlwaysOnLateralLKAS", "1", 0, "0"),
   ("AlwaysOnLateralMain", "1", 0, "0"),
   ("AMapKey1", "", 0, ""),
