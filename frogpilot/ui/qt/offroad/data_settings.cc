@@ -369,8 +369,6 @@ FrogPilotDataPanel::FrogPilotDataPanel(FrogPilotSettingsWindow *parent) : FrogPi
 
             QFile("/cache/on_backup").open(QIODevice::WriteOnly);
 
-            params.putBool("AutomaticUpdates", false);
-
             frogpilotBackupBtn->setValue(tr("Restored!"));
 
             util::sleep_for(2500);

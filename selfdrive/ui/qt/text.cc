@@ -1,4 +1,6 @@
 #include <QApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QLabel>
 #include <QPushButton>
 #include <QScrollBar>
@@ -9,6 +11,50 @@
 #include "selfdrive/ui/qt/util.h"
 #include "selfdrive/ui/qt/qt_window.h"
 #include "selfdrive/ui/qt/widgets/scrollview.h"
+
+void runRestore(QPushButton *restoreBtn) {
+  QDir backupDir("/data/backups");
+  backupDir.setNameFilters(QStringList() << "*.tar.zst" << "*.tar.gz");
+  backupDir.setSorting(QDir::Name | QDir::Reversed);
+
+  QStringList backupFiles = backupDir.entryList(QDir::Files);
+  QString latestBackup = backupFiles.first();
+
+  restoreBtn->setEnabled(false);
+  restoreBtn->setText("Restoring...");
+
+  QString extractDirectory = "/data/restore_temp";
+  QString sourcePath = backupDir.filePath(latestBackup);
+  QString targetPath = "/data/safe_staging/finalized";
+
+  QDir().mkpath(extractDirectory);
+
+  if (latestBackup.endsWith(".tar.zst")) {
+    std::system(qPrintable("zstd -d " + sourcePath + " -o " + extractDirectory + "/backup.tar"));
+    std::system(qPrintable("tar --strip-components=1 -xf " + extractDirectory + "/backup.tar -C " + extractDirectory));
+
+    QFile::remove(extractDirectory + "/backup.tar");
+  } else {
+    std::system(qPrintable("tar --strip-components=1 -xzf " + sourcePath + " -C " + extractDirectory));
+  }
+
+  QDir().mkpath(targetPath);
+
+  std::system(qPrintable("rsync -av --delete -l " + extractDirectory + "/ " + targetPath + "/"));
+
+  QFile(targetPath + "/.overlay_consistent").open(QIODevice::WriteOnly);
+  QFile("/cache/on_backup").open(QIODevice::WriteOnly);
+
+  QDir(extractDirectory).removeRecursively();
+
+  restoreBtn->setText("Restored!");
+  util::sleep_for(2500);
+
+  restoreBtn->setText("Rebooting...");
+  util::sleep_for(2500);
+
+  Hardware::reboot();
+}
 
 int main(int argc, char *argv[]) {
   initApp(argc, argv);
@@ -33,9 +79,9 @@ int main(int argc, char *argv[]) {
 
   QPushButton *btn = new QPushButton();
 #ifdef __aarch64__
-  btn->setText(QObject::tr("Reboot"));
+  btn->setText(QObject::tr("Restore"));
   QObject::connect(btn, &QPushButton::clicked, [=]() {
-    Hardware::reboot();
+    runRestore(btn);
   });
 #else
   btn->setText(QObject::tr("Exit"));
