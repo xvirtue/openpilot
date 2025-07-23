@@ -13,13 +13,16 @@ export function Modal({
     <div class="modal-overlay" tabindex="0"
       @pointerdown="${(e) => {
         if (e.target.classList.contains('modal-overlay')) {
-          onCancel();
+          onCancel && onCancel();
         }
       }}"
       @keydown="${(e) => {
-        if (e.key === 'Enter') {
+        if (e.key === 'Enter' && onConfirm) {
           e.preventDefault();
           onConfirm();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          onCancel && onCancel();
         }
       }}"
     >
@@ -27,8 +30,8 @@ export function Modal({
         <div class="modal-header">${title}</div>
         <div class="modal-body">${message}</div>
         <div class="modal-actions">
-          <button class="btn" @click="${onCancel}">${cancelText}</button>
-          <button class="btn ${confirmClass}" @click="${onConfirm}">${confirmText}</button>
+          ${onCancel ? html`<button class="btn" @click="${onCancel}">${cancelText}</button>` : ''}
+          ${onConfirm ? html`<button class="btn ${confirmClass}" @click="${onConfirm}">${confirmText}</button>` : ''}
         </div>
       </div>
     </div>

@@ -4,13 +4,16 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, Response, jsonify, render_template, request, send_file, send_from_directory
 from io import BytesIO
 from pathlib import Path
+from werkzeug.utils import secure_filename
 
+import base64
 import errno
 import json
 import os
 import re
 import requests
 import secrets
+import shutil
 import signal
 import subprocess
 import time
@@ -26,8 +29,13 @@ from openpilot.system.version import get_build_metadata
 from panda import Panda
 
 from openpilot.frogpilot.common.frogpilot_utilities import delete_file, run_cmd
-from openpilot.frogpilot.common.frogpilot_variables import ERROR_LOGS_PATH, EXCLUDED_KEYS, SCREEN_RECORDINGS_PATH, frogpilot_default_params, params, update_frogpilot_toggles
+from openpilot.frogpilot.common.frogpilot_variables import ACTIVE_THEME_PATH, ERROR_LOGS_PATH, EXCLUDED_KEYS, SCREEN_RECORDINGS_PATH, THEME_SAVE_PATH, frogpilot_default_params, params, update_frogpilot_toggles
 from openpilot.frogpilot.system.the_pond import utilities
+
+GITLAB_API = "https://gitlab.com/api/v4"
+GITLAB_SUBMISSIONS_PROJECT_ID = "71858085"
+GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
+HEADERS = {"PRIVATE-TOKEN": GITLAB_TOKEN}
 
 FOOTAGE_PATHS = [
   Paths.log_root(HD=True, raw=True),
@@ -67,7 +75,7 @@ def setup(app):
         panda.set_safety_mode(panda.SAFETY_TOYOTA)
         panda.can_send(0x750, LOCK_CMD, 0)
         panda.send_heartbeat()
-    return { "message": "Doors locked!" }
+    return {"message": "Doors locked!"}
 
   @app.route("/api/doors/unlock", methods=["POST"])
   def unlock_doors():
@@ -76,7 +84,7 @@ def setup(app):
         panda.set_safety_mode(panda.SAFETY_TOYOTA)
         panda.can_send(0x750, UNLOCK_CMD, 0)
         panda.send_heartbeat()
-    return { "message": "Doors unlocked!" }
+    return {"message": "Doors unlocked!"}
 
   @app.route("/api/error_logs", methods=["GET"])
   def get_error_logs():
@@ -161,6 +169,7 @@ def setup(app):
     existing = json.loads(params.get("FavoriteDestinations", encoding="utf8") or "[]")
     if new_favorites not in existing:
       existing.append(new_favorites)
+
     params.put("FavoriteDestinations", json.dumps(existing))
     return {"message": "Destination added to favorites!"}
 
@@ -234,7 +243,6 @@ def setup(app):
         return jsonify(error=f"{meta[3]} is invalid or too short..."), 400
 
       params.put(meta[2], full)
-
       saved.append(meta[3])
 
     if not saved:
@@ -254,206 +262,19 @@ def setup(app):
       yield f"data: {json.dumps({'progress': 0, 'total': total})}\n\n"
 
       with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-          executor.submit(utilities.process_route, path, name): (path, name)
-          for path, name in routes
-        }
-
+        futures = {executor.submit(utilities.process_route, path, name): (path, name) for path, name in routes}
         for processed, future in enumerate(as_completed(futures), start=1):
-          path, name = futures[future]
           try:
             result = future.result()
             yield f"data: {json.dumps({'routes': [result]})}\n\n"
           except Exception as e:
             print(f"Error processing route: {e}")
-
-          progress = json.dumps({"progress": processed, "total": total})
-          yield f"data: {progress}\n\n"
+          yield f"data: {json.dumps({'progress': processed, 'total': total})}\n\n"
 
         for path, name in routes:
           utilities.process_route_gif(path, name)
 
     return Response(generate(), mimetype="text/event-stream")
-
-  @app.route("/api/routes/clear_name", methods=["POST"])
-  def clear_route_name():
-    data = request.get_json()
-    route_name = data.get("name")
-
-    if not route_name:
-      return jsonify({"error": "Missing route name"}), 400
-
-    cleared = False
-    original_timestamp = None
-    for footage_path in FOOTAGE_PATHS:
-      if not os.path.exists(footage_path):
-        continue
-
-      segments_to_process = [s for s in os.listdir(footage_path) if s.startswith(route_name) and os.path.isdir(os.path.join(footage_path, s))]
-
-      if not segments_to_process:
-        continue
-
-      for segment in segments_to_process:
-        segment_dir = os.path.join(footage_path, segment)
-        for item in os.listdir(segment_dir):
-          if not item.endswith((".hevc", ".ts", ".png", ".gif")) and item not in utilities.LOG_CANDIDATES:
-            try:
-              os.remove(os.path.join(segment_dir, item))
-              cleared = True
-            except OSError:
-              pass
-        if cleared:
-            rlog_path = f"{segment_dir}/rlog"
-            route_timestamp_dt = utilities.get_route_start_time(rlog_path)
-            original_timestamp = route_timestamp_dt.isoformat() if route_timestamp_dt else None
-
-
-    if cleared:
-      return jsonify({"message": "Route name cleared successfully!", "timestamp": original_timestamp}), 200
-    else:
-      return jsonify({"error": "Route not found or no custom name to clear"}), 404
-
-  @app.route("/api/routes/rename", methods=["POST"])
-  def rename_route():
-    data = request.get_json()
-    old_name = data.get("old")
-    new_name = data.get("new")
-
-    if not old_name or not new_name:
-      return jsonify({"error": "Missing old or new name"}), 400
-
-    renamed = False
-    for footage_path in FOOTAGE_PATHS:
-      if not os.path.exists(footage_path):
-        continue
-
-      segments_to_process = [s for s in os.listdir(footage_path) if s.startswith(old_name) and os.path.isdir(os.path.join(footage_path, s))]
-
-      if not segments_to_process:
-        continue
-
-      for segment in segments_to_process:
-        segment_dir = os.path.join(footage_path, segment)
-        for item in os.listdir(segment_dir):
-          if not item.endswith((".hevc", ".ts", ".png", ".gif", "rlog")):
-            try:
-              os.remove(os.path.join(segment_dir, item))
-            except OSError:
-              pass
-
-      for segment in segments_to_process:
-        segment_dir = os.path.join(footage_path, segment)
-        new_name_file_path = os.path.join(segment_dir, new_name)
-        try:
-          with open(new_name_file_path, "a"):
-            os.utime(new_name_file_path, None)
-          renamed = True
-        except OSError as e:
-          return jsonify({"error": f"Error creating new name file: {e}"}), 500
-
-    if renamed:
-      return jsonify({"message": "Route renamed successfully!"}), 200
-    else:
-      return jsonify({"error": "Route not found"}), 404
-
-  @app.route("/api/screen_recordings/delete/<path:filename>", methods=["DELETE"])
-  def delete_screen_recording(filename):
-    mp4_path = SCREEN_RECORDINGS_PATH / filename
-    if not mp4_path.exists():
-      return {"error": "File not found"}, 404
-
-    delete_file(str(mp4_path))
-
-    for ext in (".png", ".gif"):
-      thumb = mp4_path.with_suffix(ext)
-      if thumb.exists():
-        delete_file(str(thumb))
-
-    return {"message": "Deleted"}, 200
-
-  @app.route("/api/screen_recordings/delete_all", methods=["DELETE"])
-  def delete_all_screen_recordings():
-    def generate():
-      files_to_delete = [f for f in os.listdir(SCREEN_RECORDINGS_PATH) if f.endswith(".mp4")]
-      for filename in files_to_delete:
-        delete_file(os.path.join(SCREEN_RECORDINGS_PATH, filename))
-        for ext in (".png", ".gif"):
-          thumb = os.path.join(SCREEN_RECORDINGS_PATH, filename.replace(".mp4", ext))
-          if os.path.exists(thumb):
-            delete_file(thumb)
-        yield f"data: {json.dumps({'deleted_recording': filename})}\\n\\n"
-        time.sleep(0.1)
-      yield f"data: {json.dumps({'status': 'complete'})}\\n\\n"
-    return Response(generate(), mimetype="text/event-stream")
-
-  @app.route("/api/screen_recordings/download/<path:filename>", methods=["GET"])
-  def download_screen_recording(filename):
-    return send_from_directory(SCREEN_RECORDINGS_PATH, filename, as_attachment=True)
-
-  @app.route("/api/screen_recordings/list", methods=["GET"])
-  def list_screen_recordings():
-    def generate():
-      recordings = sorted(
-        [r for r in SCREEN_RECORDINGS_PATH.glob("*.mp4") if not Path(f"{r}.lock").exists()],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
-      )
-      total = len(recordings)
-      yield f"data: {json.dumps({'progress': 0, 'total': total})}\n\n"
-
-      with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-          executor.submit(utilities.process_screen_recording, mp4): mp4
-          for mp4 in recordings
-        }
-
-        for processed, future in enumerate(as_completed(futures), start=1):
-          mp4 = futures[future]
-          try:
-            result = future.result()
-            yield f"data: {json.dumps({'recordings': [result]})}\n\n"
-          except Exception as e:
-            print(f"Error processing recording: {e}")
-
-          progress = json.dumps({"progress": processed, "total": total})
-          yield f"data: {progress}\n\n"
-
-        for recording in recordings:
-          utilities.process_screen_recording_gif(recording)
-
-    return Response(generate(), mimetype="text/event-stream")
-
-  @app.route("/screen_recordings/<path:filename>", methods=["GET"])
-  def serve_screen_recording_asset(filename):
-    return send_from_directory(SCREEN_RECORDINGS_PATH, filename)
-
-  @app.route("/api/screen_recordings/rename", methods=["POST"])
-  def rename_screen_recording():
-    data = request.get_json() or {}
-
-    old = data.get("old")
-    new = data.get("new")
-
-    if not old or not new:
-      return {"error": "Missing filenames"}, 400
-
-    old_path = SCREEN_RECORDINGS_PATH / old
-    new_path = SCREEN_RECORDINGS_PATH / new
-
-    if not old_path.exists():
-      return {"error": "Original file not found"}, 404
-
-    if new_path.exists():
-      return {"error": "Target file already exists"}, 400
-
-    old_path.rename(new_path)
-    for extension in (".png", ".gif"):
-      old = old_path.with_suffix(extension)
-      new = new_path.with_suffix(extension)
-      if old.exists():
-        old.rename(new)
-    return {"message": "Renamed"}, 200
 
   @app.route("/api/routes/<name>", methods=["DELETE"])
   def delete_route(name):
@@ -477,9 +298,10 @@ def setup(app):
           if os.path.exists(footage_path):
             for segment in os.listdir(footage_path):
               if segment.startswith(route_name):
-                  delete_file(os.path.join(footage_path, segment))
-          yield f"data: {json.dumps({'deleted_route': route_name})}\\n\\n"
-          time.sleep(0.1)
+                delete_file(os.path.join(footage_path, segment))
+
+        yield f"data: {json.dumps({'deleted_route': route_name})}\\n\\n"
+        time.sleep(0.1)
 
       yield f"data: {json.dumps({'status': 'complete'})}\\n\\n"
     return Response(generate(), mimetype="text/event-stream")
@@ -524,11 +346,7 @@ def setup(app):
           break
 
         segment_urls = [f"/video/{segment}" for segment in segments]
-        total_duration = 0
-        for i in range(len(segment_urls)):
-          segment_path = f"{footage_path}{name}--{i}/fcamera.hevc"
-          total_duration += utilities.get_video_duration(segment_path)
-
+        total_duration = sum(utilities.get_video_duration(f"{footage_path}{name}--{i}/fcamera.hevc") for i in range(len(segment_urls)))
         return {
           "name": name,
           "segment_urls": segment_urls,
@@ -538,11 +356,194 @@ def setup(app):
         }, 200
     return {"error": "Route not found"}, 404
 
+  @app.route("/api/routes/clear_name", methods=["POST"])
+  def clear_route_name():
+    data = request.get_json()
+    route_name = data.get("name")
+
+    if not route_name:
+      return jsonify({"error": "Missing route name"}), 400
+
+    cleared = False
+    original_timestamp = None
+    for footage_path in FOOTAGE_PATHS:
+      if not os.path.exists(footage_path):
+        continue
+
+      segments_to_process = [s for s in os.listdir(footage_path) if s.startswith(route_name) and os.path.isdir(os.path.join(footage_path, s))]
+      if not segments_to_process:
+        continue
+
+      for segment in segments_to_process:
+        segment_dir = os.path.join(footage_path, segment)
+        for item in os.listdir(segment_dir):
+          if not item.endswith((".hevc", ".ts", ".png", ".gif")) and item not in utilities.LOG_CANDIDATES:
+            try:
+              os.remove(os.path.join(segment_dir, item))
+              cleared = True
+            except OSError:
+              pass
+
+        if cleared:
+          rlog_path = f"{segment_dir}/rlog"
+          route_timestamp_dt = utilities.get_route_start_time(rlog_path)
+          original_timestamp = route_timestamp_dt.isoformat() if route_timestamp_dt else None
+
+    if cleared:
+      return jsonify({"message": "Route name cleared successfully!", "timestamp": original_timestamp}), 200
+    else:
+      return jsonify({"error": "Route not found or no custom name to clear"}), 404
+
+  @app.route("/api/routes/rename", methods=["POST"])
+  def rename_route():
+    data = request.get_json()
+    old_name = data.get("old")
+    new_name_raw = data.get("new")
+
+    if not old_name or not new_name_raw:
+      return jsonify({"error": "Missing old or new name"}), 400
+
+    new_name = secure_filename(new_name_raw)
+    renamed = False
+
+    for footage_path in FOOTAGE_PATHS:
+      if not os.path.exists(footage_path):
+        continue
+
+      segments_to_process = [s for s in os.listdir(footage_path) if s.startswith(old_name) and os.path.isdir(os.path.join(footage_path, s))]
+      if not segments_to_process:
+        continue
+
+      for segment in segments_to_process:
+        segment_dir = os.path.join(footage_path, segment)
+        for item in os.listdir(segment_dir):
+          if not item.endswith((".hevc", ".ts", ".png", ".gif", "rlog")):
+            try:
+              os.remove(os.path.join(segment_dir, item))
+            except OSError:
+              pass
+
+      for segment in segments_to_process:
+        segment_dir = os.path.join(footage_path, segment)
+        new_name_file_path = os.path.join(segment_dir, new_name)
+
+        try:
+          with open(new_name_file_path, "a"):
+            os.utime(new_name_file_path, None)
+          renamed = True
+        except OSError as e:
+          return jsonify({"error": f"Error creating new name file: {e}"}), 500
+
+    if renamed:
+      return jsonify({"message": "Route renamed successfully!"}), 200
+    else:
+      return jsonify({"error": "Route not found"}), 404
+
+  @app.route("/api/screen_recordings/delete/<path:filename>", methods=["DELETE"])
+  def delete_screen_recording(filename):
+    mp4_path = SCREEN_RECORDINGS_PATH / filename
+    if not mp4_path.exists():
+      return {"error": "File not found"}, 404
+
+    delete_file(str(mp4_path))
+
+    for ext in (".png", ".gif"):
+      thumb = mp4_path.with_suffix(ext)
+      if thumb.exists():
+        delete_file(str(thumb))
+
+    return {"message": "Deleted"}, 200
+
+  @app.route("/api/screen_recordings/delete_all", methods=["DELETE"])
+  def delete_all_screen_recordings():
+    def generate():
+      files_to_delete = [f for f in os.listdir(SCREEN_RECORDINGS_PATH) if f.endswith(".mp4")]
+      for filename in files_to_delete:
+        delete_file(os.path.join(SCREEN_RECORDINGS_PATH, filename))
+        for ext in (".png", ".gif"):
+          thumb = os.path.join(SCREEN_RECORDINGS_PATH, filename.replace(".mp4", ext))
+          if os.path.exists(thumb):
+            delete_file(thumb)
+
+        yield f"data: {json.dumps({'deleted_recording': filename})}\\n\\n"
+
+        time.sleep(0.1)
+
+      yield f"data: {json.dumps({'status': 'complete'})}\\n\\n"
+
+    return Response(generate(), mimetype="text/event-stream")
+
+  @app.route("/api/screen_recordings/download/<path:filename>", methods=["GET"])
+  def download_screen_recording(filename):
+    return send_from_directory(SCREEN_RECORDINGS_PATH, filename, as_attachment=True)
+
+  @app.route("/api/screen_recordings/list", methods=["GET"])
+  def list_screen_recordings():
+    def generate():
+      recordings = sorted(
+        [recording for recording in SCREEN_RECORDINGS_PATH.glob("*.mp4") if not Path(f"{recording}.lock").exists()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+      )
+      total = len(recordings)
+
+      yield f"data: {json.dumps({'progress': 0, 'total': total})}\n\n"
+
+      with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(utilities.process_screen_recording, mp4): mp4 for mp4 in recordings}
+        for processed, future in enumerate(as_completed(futures), start=1):
+          try:
+            result = future.result()
+            yield f"data: {json.dumps({'recordings': [result]})}\n\n"
+          except Exception as e:
+            print(f"Error processing recording: {e}")
+
+          yield f"data: {json.dumps({'progress': processed, 'total': total})}\n\n"
+
+        for recording in recordings:
+          utilities.process_screen_recording_gif(recording)
+
+    return Response(generate(), mimetype="text/event-stream")
+
+  @app.route("/screen_recordings/<path:filename>", methods=["GET"])
+  def serve_screen_recording_asset(filename):
+    return send_from_directory(SCREEN_RECORDINGS_PATH, filename)
+
+  @app.route("/api/screen_recordings/rename", methods=["POST"])
+  def rename_screen_recording():
+    data = request.get_json() or {}
+    old = data.get("old")
+    new_raw = data.get("new")
+
+    if not old or not new_raw:
+      return {"error": "Missing filenames"}, 400
+
+    new = secure_filename(new_raw)
+    old_path = SCREEN_RECORDINGS_PATH / old
+    new_path = SCREEN_RECORDINGS_PATH / new
+
+    if not old_path.exists():
+      return {"error": "Original file not found"}, 404
+
+    if new_path.exists():
+      return {"error": "Target file already exists"}, 400
+
+    old_path.rename(new_path)
+    for extension in (".png", ".gif"):
+      old_thumb = old_path.with_suffix(extension)
+      new_thumb = new_path.with_suffix(extension)
+
+      if old_thumb.exists():
+        old_thumb.rename(new_thumb)
+
+    return {"message": "Renamed"}, 200
+
   @app.route("/api/speed_limits", methods=["GET"])
   def speed_limits():
     data = json.loads(params.get("SpeedLimitsFiltered") or "[]")
     current_time = (datetime.now(timezone.utc) - timedelta(days=6, hours=23)).isoformat()
     data = [{**e, "last_vetted": current_time} for e in data]
+
     params.put("SpeedLimitsFiltered", json.dumps(data))
 
     buffer = BytesIO(json.dumps(data, indent=2).encode())
@@ -591,6 +592,7 @@ def setup(app):
     base = "/data/tailscale"
     tailscale_binary = f"{base}/tailscale"
     tailscaled_binary = f"{base}/tailscaled"
+
     systemd_unit = "/etc/systemd/system/tailscaled.service"
 
     if os.path.exists(tailscale_binary) and os.path.exists(tailscaled_binary) and os.path.exists(systemd_unit):
@@ -611,12 +613,14 @@ def setup(app):
       "curl -s https://pkgs.tailscale.com/stable/ | grep -oP 'tailscale_\\K[0-9]+\\.[0-9]+\\.[0-9]+' | sort -V | tail -1",
       shell=True, capture_output=True, text=True
     )
+
     version = result.stdout.strip() or "1.84.0"
 
     bin_dir = f"{base}/tailscale_{version}_{arch}"
     state = f"{base}/state"
     socket = f"{base}/tailscaled.sock"
     tgz_path = f"{base}/tailscale.tgz"
+
     tgz_url = f"https://pkgs.tailscale.com/stable/tailscale_{version}_{arch}.tgz"
 
     os.makedirs(state, exist_ok=True)
@@ -710,6 +714,348 @@ def setup(app):
 
     return jsonify({"message": "Tailscale uninstalled!"}), 200
 
+  @app.route("/api/themes", methods=["POST"])
+  def save_theme_route():
+    theme_path, error = utilities.create_theme(request.form, request.files)
+    if error:
+      return jsonify({"message": error}), 400
+    return jsonify({"message": f"Theme '{request.form.get('themeName')}' saved successfully!"}), 200
+
+  @app.route("/api/themes/asset/<theme_name>/<path:asset_path>", methods=["GET"])
+  def get_theme_asset(theme_name, asset_path):
+    sane_theme_name = secure_filename(theme_name.replace(" ", "_"))
+
+    if "steering_wheel" in asset_path:
+      base_path = THEME_SAVE_PATH / "steering_wheels"
+      file_path = base_path / asset_path.split("/")[-1]
+    elif theme_name == "default":
+      base_path = ACTIVE_THEME_PATH
+      file_path = base_path / asset_path
+    else:
+      base_path = THEME_SAVE_PATH / "theme_packs" / sane_theme_name
+      file_path = base_path / asset_path
+
+    if file_path.exists() and file_path.is_file():
+      return send_file(str(file_path))
+
+    return jsonify({"error": "Asset not found"}), 404
+
+  @app.route("/api/themes/delete/<theme_name>", methods=["DELETE"])
+  def delete_theme(theme_name):
+    sane_theme_name = secure_filename(theme_name.replace(" ", "_"))
+    theme_path = THEME_SAVE_PATH / "theme_packs" / sane_theme_name
+    if not theme_path.is_dir():
+      return jsonify({"message": "Theme not found."}), 404
+
+    shutil.rmtree(theme_path)
+
+    return jsonify({"message": f"Theme '{theme_name}' deleted."}), 200
+
+  @app.route("/api/themes/default", methods=["GET"])
+  def get_default_theme():
+    theme_data = {
+      "colors": {},
+      "images": {},
+      "sounds": {},
+      "turnSignalLength": 100,
+      "turnSignalType": "Single Image",
+      "sequentialImages": [],
+    }
+
+    colors_path = ACTIVE_THEME_PATH / "colors" / "colors.json"
+    if colors_path.exists():
+      with open(colors_path, "r") as f:
+        theme_data["colors"] = json.load(f)
+
+    signals_path = ACTIVE_THEME_PATH / "signals"
+    if signals_path.exists() and signals_path.is_dir():
+      sequential_images = []
+      has_single_image = False
+      for file in os.listdir(signals_path):
+        if file.startswith("turn_signal_") and any(file.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.svg']):
+          try:
+            int(file.split('_')[-1].split('.')[0])
+            sequential_images.append(file)
+          except ValueError:
+            pass
+        elif Path(file).stem == 'turn_signal':
+          has_single_image = True
+          theme_data["images"]["turnSignal"] = file
+        elif Path(file).stem == "turn_signal_blindspot":
+          theme_data["images"]["turnSignalBlindspot"] = file
+        elif "_" in file and not any(file.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.svg']):
+          parts = file.split("_")
+          if len(parts) == 2:
+            theme_data["turnSignalStyle"] = parts[0].capitalize()
+            try:
+              theme_data["turnSignalLength"] = int(parts[1])
+            except (ValueError, IndexError):
+              pass
+
+      if sequential_images:
+        theme_data["turnSignalType"] = "Sequential"
+        sequential_images.sort(key=lambda name: int(name.split('_')[-1].split('.')[0]))
+        theme_data['sequentialImages'] = sequential_images
+      elif has_single_image:
+        theme_data["turnSignalType"] = "Single Image"
+
+    icons_path = ACTIVE_THEME_PATH / "icons"
+    if icons_path.exists() and icons_path.is_dir():
+      for file in os.listdir(icons_path):
+        if Path(file).stem == "button_settings":
+          theme_data["images"]["settingsButton"] = file
+        elif Path(file).stem == "button_home":
+          theme_data["images"]["homeButton"] = file
+
+    wheel_path = ACTIVE_THEME_PATH / "steering_wheel"
+    if wheel_path.exists() and wheel_path.is_dir():
+        wheel_files = list(wheel_path.glob("wheel.*"))
+        if wheel_files:
+            original_path = wheel_files[0].resolve()
+            theme_data["images"]["steeringWheel"] = original_path.name
+
+    distance_icons_path = ACTIVE_THEME_PATH / "distance_icons"
+    if distance_icons_path.exists() and distance_icons_path.is_dir():
+      theme_data["images"]["distanceIcons"] = {}
+      for file in os.listdir(distance_icons_path):
+        key = Path(file).stem
+        if key in ["traffic", "aggressive", "standard", "relaxed"]:
+          theme_data["images"]["distanceIcons"][key] = file
+
+    sounds_path = ACTIVE_THEME_PATH / "sounds"
+    if sounds_path.exists() and sounds_path.is_dir():
+      valid_sound_keys = ["engage", "disengage", "prompt_repeat", "startup"]
+      for file in os.listdir(sounds_path):
+        if Path(file).stem in valid_sound_keys:
+          theme_data["sounds"][Path(file).stem] = file
+
+    return jsonify(theme_data)
+
+  @app.route("/api/themes/download", methods=["POST"])
+  def download_theme_route():
+    theme_path, error = utilities.create_theme(request.form, request.files, temporary=True)
+    if error:
+      return jsonify({"message": error}), 400
+
+    sane_theme_name = secure_filename(request.form.get("themeName").replace(" ", "_"))
+
+    archive_path = shutil.make_archive(str(theme_path.parent / sane_theme_name), "zip", theme_path.parent, sane_theme_name)
+
+    memory_file = BytesIO()
+    with open(archive_path, "rb") as f:
+      memory_file.write(f.read())
+    memory_file.seek(0)
+
+    shutil.rmtree(theme_path.parent)
+
+    return send_file(memory_file, download_name=f'{sane_theme_name}.zip', as_attachment=True)
+
+  @app.route("/api/themes/list", methods=["GET"])
+  def list_user_themes():
+    themes_path = THEME_SAVE_PATH / "theme_packs"
+    user_themes = []
+    if themes_path.exists() and themes_path.is_dir():
+      for theme_dir in themes_path.iterdir():
+        if theme_dir.is_dir() and (theme_dir / "user_created").exists():
+          user_themes.append(theme_dir.name)
+    return jsonify(sorted(user_themes))
+
+  @app.route("/api/themes/load/<theme_name>", methods=["GET"])
+  def load_theme(theme_name):
+    sane_theme_name = secure_filename(theme_name.replace(" ", "_"))
+    theme_path = THEME_SAVE_PATH / "theme_packs" / sane_theme_name
+    if not theme_path.is_dir() or not (theme_path / "user_created").exists():
+      return jsonify({"message": "Theme not found."}), 404
+
+    theme_data = {
+      "themeName": theme_name,
+      "colors": {},
+      "images": {},
+      "sounds": {},
+      "turnSignalLength": 100,
+      "turnSignalType": "Single Image",
+      "sequentialImages": [],
+    }
+
+    colors_path = theme_path / "colors" / "colors.json"
+    if colors_path.exists():
+      with open(colors_path, "r") as f:
+        theme_data["colors"] = json.load(f)
+
+    signals_path = theme_path / "signals"
+    if signals_path.exists():
+      sequential_image_files = []
+      has_single_image = False
+      for file in os.listdir(signals_path):
+        if file.startswith("turn_signal_") and any(file.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.svg']):
+          try:
+            int(file.split('_')[-1].split('.')[0])
+            sequential_image_files.append(file)
+          except ValueError:
+            pass
+        elif Path(file).stem == 'turn_signal':
+          has_single_image = True
+        elif "_" in file and not any(file.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.svg']):
+          parts = file.split("_")
+          if len(parts) == 2:
+            theme_data["turnSignalStyle"] = parts[0].capitalize()
+            try:
+              theme_data["turnSignalLength"] = int(parts[1])
+            except (ValueError, IndexError):
+              pass
+
+      if sequential_image_files:
+        theme_data["turnSignalType"] = "Sequential"
+        sequential_image_files.sort(key=lambda name: int(name.split('_')[-1].split('.')[0]))
+        theme_data['sequentialImages'] = sequential_image_files
+      elif has_single_image:
+        theme_data["turnSignalType"] = "Single Image"
+
+    image_map = {
+      "settingsButton": ("icons", "button_settings"),
+      "homeButton": ("icons", "button_home"),
+      "turnSignal": ("signals", "turn_signal"),
+      "turnSignalBlindspot": ("signals", "turn_signal_blindspot"),
+    }
+    for key, (folder, name_prefix) in image_map.items():
+      folder_path = theme_path / folder
+      if folder_path.exists():
+        for file in os.listdir(folder_path):
+          if Path(file).stem == name_prefix:
+            theme_data["images"][key] = file
+            break
+
+    wheel_path = THEME_SAVE_PATH / "steering_wheels"
+    if wheel_path.exists():
+      for f in wheel_path.glob(f"{sane_theme_name}.*"):
+        theme_data["images"]["steeringWheel"] = f.name
+        break
+
+    distance_icons_path = theme_path / "distance_icons"
+    if distance_icons_path.exists():
+      theme_data["images"]["distanceIcons"] = {}
+      for file in os.listdir(distance_icons_path):
+        key = Path(file).stem
+        if key in ["traffic", "aggressive", "standard", "relaxed"]:
+          theme_data["images"]["distanceIcons"][key] = file
+
+    sounds_path = theme_path / "sounds"
+    if sounds_path.exists():
+      valid_sound_keys = ["engage", "disengage", "prompt_repeat", "startup"]
+      for file in os.listdir(sounds_path):
+        key = Path(file).stem
+        if key in valid_sound_keys:
+          theme_data["sounds"][key] = file
+
+    return jsonify(theme_data), 200
+
+  @app.route("/api/themes/submit", methods=["POST"])
+  def submit_theme():
+    if not GITLAB_TOKEN:
+      return jsonify({"error": "Missing GitLab token"}), 500
+
+    try:
+      theme_name = request.form.get("themeName")
+      if not theme_name:
+        return jsonify({"error": "Missing theme name"}), 400
+
+      discord_username = request.form.get("discordUsername")
+      if discord_username:
+        params.put("DiscordUsername", discord_username)
+
+      theme_path, error = utilities.create_theme(request.form, request.files, temporary=True)
+      if error:
+        return jsonify({"message": error}), 400
+
+      safe_theme_name = secure_filename(theme_name.replace(" ", "_"))
+      timestamp = int(time.time())
+      submission_branch = f"theme-submission-{safe_theme_name}-{timestamp}"
+
+      def gitlab_post(project_id, endpoint, payload):
+        url = f"{GITLAB_API}/projects/{project_id}/{endpoint}"
+        resp = requests.post(url, headers=HEADERS, json=payload)
+        if resp.status_code not in (200, 201):
+          raise RuntimeError(f"GitLab API error {resp.status_code}: {resp.text}")
+        return resp.json()
+
+      def create_branch(project_id, ref, branch_name):
+        return gitlab_post(project_id, "repository/branches", {"branch": branch_name, "ref": ref})
+
+      def commit_files(project_id, branch, commit_msg, actions):
+        return gitlab_post(project_id, "repository/commits", {
+          "branch": branch,
+          "commit_message": commit_msg,
+          "actions": actions
+        })
+
+      def encode_file_base64(path):
+        with open(path, "rb") as f:
+          return base64.b64encode(f.read()).decode("utf-8")
+
+      actions = []
+      for folder in ["colors", "icons", "signals", "sounds"]:
+        folder_path = theme_path / folder
+        if folder_path.exists() and any(folder_path.iterdir()):
+          zip_path = shutil.make_archive(str(folder_path), "zip", folder_path)
+          encoded = encode_file_base64(zip_path)
+          actions.append({
+            "action": "create",
+            "file_path": f"{safe_theme_name}/{folder}.zip",
+            "content": encoded,
+            "encoding": "base64"
+          })
+
+      distance_icons_path = theme_path / "distance_icons"
+      if distance_icons_path.exists() and any(distance_icons_path.iterdir()):
+        zip_path = shutil.make_archive(str(distance_icons_path), "zip", distance_icons_path)
+        encoded = encode_file_base64(zip_path)
+        actions.append({
+          "action": "create",
+          "file_path": f"Distance-Icons/{safe_theme_name}.zip",
+          "content": encoded,
+          "encoding": "base64"
+        })
+
+      wheel_file = request.files.get("steeringWheel")
+      if wheel_file and wheel_file.filename:
+        filename = secure_filename(wheel_file.filename)
+        wheel_file.seek(0)
+        encoded_wheel = base64.b64encode(wheel_file.read()).decode("utf-8")
+        actions.append({
+          "action": "create",
+          "file_path": f"Steering-Wheels/{filename}",
+          "content": encoded_wheel,
+          "encoding": "base64"
+        })
+
+      if discord_username:
+        safe_username = secure_filename(discord_username.replace(" ", "_"))
+        actions.append({
+          "action": "create",
+          "file_path": f"{safe_theme_name}/{safe_username}.username",
+          "content": ""
+        })
+
+      if not actions:
+        return jsonify({"error": "No theme data or steering wheel file provided"}), 400
+
+      create_branch(GITLAB_SUBMISSIONS_PROJECT_ID, "main", submission_branch)
+      commit_files(GITLAB_SUBMISSIONS_PROJECT_ID, submission_branch, f"Theme Submission: {safe_theme_name}", actions)
+
+      submissions_branch_url = f"https://gitlab.com/FrogAi/Theme-Submissions/-/tree/{submission_branch}"
+
+      return jsonify({
+        "message": "Theme submission uploaded successfully.",
+        "storage_repo": submissions_branch_url
+      }), 200
+
+    except Exception as e:
+      return jsonify({"error": str(e)}), 500
+
+    finally:
+      if 'theme_path' in locals() and theme_path.parent.exists():
+        shutil.rmtree(theme_path.parent, ignore_errors=True)
+
   @app.route("/api/tmux_log/capture", methods=["POST"])
   def capture_tmux_log_route():
     TMUX_LOGS_PATH.mkdir(parents=True, exist_ok=True)
@@ -719,12 +1065,11 @@ def setup(app):
     log_path = TMUX_LOGS_PATH / log_filename
 
     run_cmd(["tmux", "capture-pane", "-J", "-S", "-"], "Captured tmux pane.", "Failed to capture tmux pane.")
-    result = subprocess.run(["tmux", "show-buffer"], capture_output=True, text=True, check=True)
 
+    result = subprocess.run(["tmux", "show-buffer"], capture_output=True, text=True, check=True)
     log_path.write_text(result.stdout, encoding="utf-8")
 
     run_cmd(["tmux", "delete-buffer"], "Deleted tmux buffer.", "Failed to delete tmux buffer.")
-
     return jsonify({"message": "Captured console log successfully!", "log_file": log_filename}), 200
 
   @app.route("/api/tmux_log/delete/<filename>", methods=["DELETE"])
@@ -739,10 +1084,10 @@ def setup(app):
   @app.route("/api/tmux_log/delete_all", methods=["DELETE"])
   def delete_all_tmux_logs():
     if TMUX_LOGS_PATH.exists():
+
       delete_file(TMUX_LOGS_PATH)
 
     TMUX_LOGS_PATH.mkdir(parents=True, exist_ok=True)
-
     return jsonify({"message": "All tmux logs deleted and folder recreated"}), 200
 
   @app.route("/api/tmux_log/download/<path:filename>", methods=["GET"])
@@ -753,14 +1098,7 @@ def setup(app):
   def list_tmux_logs():
     TMUX_LOGS_PATH.mkdir(parents=True, exist_ok=True)
     files = sorted(TMUX_LOGS_PATH.glob("*.json"), key=lambda file: file.stat().st_mtime, reverse=True)
-
-    return jsonify([
-      {
-        "filename": file.name,
-        "timestamp": file.stat().st_mtime
-      }
-      for file in files
-    ])
+    return jsonify([{"filename": file.name, "timestamp": file.stat().st_mtime} for file in files])
 
   @app.route("/api/tmux_log/live", methods=["GET"])
   def stream_tmux_log():
@@ -772,16 +1110,17 @@ def setup(app):
     def generate():
       while True:
         output = subprocess.check_output(["tmux", "capture-pane", "-t", "comma:0", "-p", "-S", "-1000"], text=True)
+
         yield "data: " + "\n".join(reversed(output.splitlines())).replace("\n", "\ndata: ") + "\n\n"
 
         time.sleep(0.1)
-
     return Response(generate(), mimetype="text/event-stream")
 
   @app.route("/api/tmux_log/rename/<old>/<new>", methods=["PUT"])
   def rename_tmux_log_path_params(old, new):
     old_path = TMUX_LOGS_PATH / old
-    new_path = TMUX_LOGS_PATH / new
+    new_safe = secure_filename(new)
+    new_path = TMUX_LOGS_PATH / new_safe
 
     if not old_path.exists():
       return jsonify({"error": "Original file not found"}), 404
@@ -790,7 +1129,8 @@ def setup(app):
       return jsonify({"error": "Target file already exists"}), 400
 
     old_path.rename(new_path)
-    return jsonify({"message": f"Renamed {old} to {new}"}), 200
+
+    return jsonify({"message": f"Renamed {old} to {new_safe}"}), 200
 
   @app.route("/api/tsk_available", methods=["GET"])
   def tsk_available():
@@ -815,6 +1155,7 @@ def setup(app):
   def save_secoc_keys():
     keys = request.get_json() or []
     params.put("SecOCKeys", json.dumps(keys))
+
     return jsonify(keys)
 
   @app.route("/api/tsk_key_set", methods=["POST"])
@@ -828,6 +1169,7 @@ def setup(app):
       return jsonify({"error": "Key value must be a string"}), 400
 
     params.put("SecOCKey", value)
+
     return "", 204
 
   @app.route("/api/toggles/backup", methods=["POST"])
@@ -850,14 +1192,14 @@ def setup(app):
 
     buffer = BytesIO(wrapped.encode("utf-8"))
     buffer.seek(0)
+
     return send_file(buffer, as_attachment=True, download_name="toggle_backup.json", mimetype="application/json")
 
   @app.route("/api/toggles/restore", methods=["POST"])
   def restore_toggle_values():
     request_data = request.get_json()
-
     if not request_data or "data" not in request_data:
-      return jsonify({ "success": False, "message": "Missing 'data' in request." }), 400
+      return jsonify({"success": False, "message": "Missing 'data' in request."}), 400
 
     allowed_keys = {key for key, _, _, _ in frogpilot_default_params if key not in EXCLUDED_KEYS}
 
@@ -867,7 +1209,7 @@ def setup(app):
         params.put(key, value)
 
     update_frogpilot_toggles()
-    return jsonify({ "success": True, "message": "Toggles restored!" })
+    return jsonify({"success": True, "message": "Toggles restored!"})
 
   @app.route("/api/toggles/reset_default", methods=["POST"])
   def reset_toggle_values():
